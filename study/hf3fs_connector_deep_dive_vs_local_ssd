@@ -1,0 +1,1263 @@
+# HF3FSConnector 源码深度导读：对照 LocalSSDConnector 学明白
+
+本文主线：
+
+- 先把 HF3FSConnector 当成一个完整 `KVConnectorBase_V1` 来读。
+- 再把它拆成 scheduler 侧、worker 侧、metadata server、HF3FS client 四块。
+- 最后逐点对照刚新增的 `LocalSSDConnector`，理解哪些是“学习版简化”，哪些是 HF3FS 的核心设计。
+
+阅读入口：
+
+- HF3FS 主 connector：
+  `vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py`
+- HF3FS request metadata：
+  `vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/utils/common.py`
+- HF3FS metadata server：
+  `vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py`
+- HF3FS 文件 I/O client：
+  `vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_client.py`
+- 对照学习版 LocalSSD：
+  `vllm/distributed/kv_transfer/kv_connector/v1/local_ssd/local_ssd_connector.py`
+
+## 1. 一句话总览
+
+HF3FSConnector 做的事情是：
+
+```text
+相同 prompt prefix
+  -> 生成 prefix block hash
+  -> scheduler 问 metadata server：这些 hash 是否全 TP rank 都写完
+  -> 命中则 scheduler 分配 GPU blocks 并发 metadata 给 worker
+  -> worker 从 HF3FS 大文件 page offset 读出 KV
+  -> scatter 回 vLLM paged KV cache
+
+新算出的 KV
+  -> worker gather GPU KV cache 到中间 buffer
+  -> metadata server 分配 rank-local page
+  -> HF3FS client 写入 rank-local 大文件
+  -> metadata server confirm write，使 key 变为可命中
+```
+
+对照 LocalSSD：
+
+```text
+LocalSSDConnector:
+  文件名本身就是 metadata
+  每个 block 一个 .bin 文件
+  文件存在 == 命中
+  同步读写，逻辑短，适合学习
+
+HF3FSConnector:
+  metadata server 管理 key -> page index
+  每个 rank 一个大文件，block 写到 page offset
+  所有 rank confirm 后才算命中
+  异步线程 + CUDA stream + HF3FS client，适合高吞吐
+```
+
+## 2. HF3FSConnector 的四层结构
+
+HF3FS 目录不是一个单文件实现，它至少有四个层次：
+
+1. `HF3FSKVConnector`
+
+   直接继承 `KVConnectorBase_V1`，负责接入 vLLM scheduler/worker API。
+   类定义在 `hf3fs_connector.py:469`。
+
+2. `AsyncOperationManager`
+
+   worker 侧异步任务管理器，负责 save/load 队列、后台线程、CUDA stream、
+   copy buffer pool、I/O thread pool。类定义在 `hf3fs_connector.py:101`。
+
+3. `Hf3fsMetadataServer` / `Hf3fsGlobalMetadataClient`
+
+   metadata server 管 key 到 page 的映射，以及“一个 key 是否所有 rank 都写完”。
+   主要状态在 `hf3fs_metadata_server.py:87-239`。
+
+4. `Hf3fsClient`
+
+   真正和 HF3FS 文件系统交互。它把 page offset + tensor buffer 转成 HF3FS
+   io_uring/iovec 读写。类定义在 `hf3fs_client.py:61`。
+
+对照 LocalSSD：
+
+- LocalSSD 把这四层基本合成一个文件。
+- LocalSSD 没有 metadata server；`_block_file_path` 就是 metadata。
+- LocalSSD 没有 `AsyncOperationManager`；`start_load_kv` 和 `wait_for_save`
+  直接同步读写。
+- LocalSSD 没有 HF3FS client；用普通 `open/read/write/os.replace`。
+
+## 3. import 和 fallback 设计
+
+HF3FS 在 `hf3fs_connector.py:72-88` 先尝试 import 真正的 HF3FS client：
+
+```text
+try:
+    from hf3fs_fuse.io import deregister_fd
+    from ...hf3fs_client import Hf3fsClient as _RealClient
+except Exception:
+    from ...hf3fs_mock_client import Hf3fsClient as _MockClient
+```
+
+这里的意图是：
+
+- 如果环境有 `hf3fs_fuse.io`，使用真实 HF3FS client。
+- 如果没有，退化成 mock client，方便开发、测试或普通文件调试。
+- connector 主体不用关心底层是真 HF3FS 还是 mock，因为二者都提供
+  `batch_read` / `batch_write` / `close`。
+
+对照 LocalSSD：
+
+- LocalSSD 没有 fallback 层，因为它天然只依赖本地文件系统。
+- LocalSSD 的 `_save_one_block` / `_load_one_block` 就是最朴素的文件 I/O。
+
+## 4. AsyncOperationManager：HF3FS 的异步心脏
+
+`AsyncOperationManager.__init__` 在 `hf3fs_connector.py:106-129` 做三件事：
+
+1. 把 connector 上常用配置复制到自己身上。
+2. 初始化 CUDA stream、CUDA event、buffer allocator。
+3. 初始化 save/load 队列、后台线程、I/O thread pool。
+
+### 4.1 为什么要复制 connector 字段
+
+它复制了：
+
+- `_device`
+- `_dtype`
+- `_shape_per_page`
+- `_bytes_per_page`
+- `_rank`
+- `_numjobs`
+- `_max_device_buffer_count`
+
+这些都是每次 save/load 都会用到的热路径信息。复制不是必须，但让
+`AsyncOperationManager` 像一个独立 worker runtime，不用每行都写
+`self._connector.xxx`。
+
+LocalSSD 对照：
+
+- LocalSSD 没有单独 manager。
+- 这些字段都直接放在 connector 对象上，比如
+  `local_ssd_connector.py:289-330`。
+
+### 4.2 CUDA 资源
+
+`_init_cuda_resources` 在 `hf3fs_connector.py:131-150`：
+
+- `_save_stream`：专门跑 save 相关 gather。
+- `_load_stream`：专门跑 load 相关 scatter。
+- `_save_event`：代码里创建了，但当前未实际使用，是一个可疑的遗留字段。
+- `_save_buffer_allocator` 和 `_load_buffer_allocator`：预分配/复用 device
+  buffers，减少频繁 `torch.empty`。
+
+LocalSSD 对照：
+
+- LocalSSD 每个 block 保存时直接 `torch.empty` 一个 page tensor，
+  见 `local_ssd_connector.py:756-762`。
+- 这样更简单，但高吞吐下会有更多分配开销。
+
+### 4.3 线程和队列
+
+`_init_worker_threads` 在 `hf3fs_connector.py:152-169`：
+
+- `_save_queue` 接收 save 任务。
+- `_load_queue` 接收 load 任务。
+- `_io_executor` 是 `ThreadPoolExecutor(max_workers=_numjobs)`。
+- `_save_thread` 和 `_load_thread` 是两个后台调度线程。
+
+注意这里有两层线程：
+
+- save/load worker thread：从队列取任务，并组织一批 I/O。
+- io_executor thread pool：真正执行多个 `client.batch_read/write`。
+
+LocalSSD 对照：
+
+- LocalSSD 没有队列。
+- `wait_for_save` 的循环直接调用 `_save_one_block`。
+- `start_load_kv` 的循环直接调用 `_load_one_block`。
+- 学习时更好懂，但 forward 路径会被文件 I/O 阻塞。
+
+## 5. save 任务提交：从 wait_for_save 到后台队列
+
+HF3FS 的 `save_kv_layer` 是空函数，见 `hf3fs_connector.py:610-618`。
+真正保存是在 `wait_for_save` 中提交异步任务，见 `hf3fs_connector.py:620-639`。
+
+流程：
+
+1. 取当前 step 的 connector metadata。
+2. 遍历每个 request。
+3. 跳过没有 `save_block_op` 的 request。
+4. 用 `skip_leading_blocks` 跳过已保存或已命中的前缀。
+5. `_generate_block_hashes` 生成要保存的 block hashes。
+6. 从 request.block_ids 中切出对应 GPU block ids。
+7. 每 `_max_device_buffer_count` 个 blocks 分一批提交给 async manager。
+
+为什么 `wait_for_save` 反而“不 wait”？
+
+- vLLM 的接口名来自通用 connector 设计。
+- HF3FS 这里选择在这个 hook 里“发起 save”，而不是等待 save 完成。
+- 真正完成由 `get_finished` 上报，见 `hf3fs_connector.py:667-670`。
+
+LocalSSD 对照：
+
+- LocalSSD 的 `save_kv_layer` 也为空，见 `local_ssd_connector.py:364-372`。
+- LocalSSD 的 `wait_for_save` 真的同步保存所有 blocks，见
+  `local_ssd_connector.py:374-397`。
+- 所以 LocalSSD 更符合“函数名直觉”，HF3FS 更符合“异步吞吐优先”。
+
+## 6. submit_save_operation：为何要记录 main_stream_event
+
+`submit_save_operation` 在 `hf3fs_connector.py:171-182`：
+
+```text
+future = Future()
+main_stream_event = torch.cuda.Event()
+main_stream_event.record()
+task = (request_id, block_ids, block_hashes, future, main_stream_event)
+_save_queue.put(task)
+_save_futures[request_id].append(future)
+```
+
+这里的关键是 `main_stream_event.record()`。
+
+含义：
+
+- 当前 forward 可能刚刚把 KV 写进 paged KV cache。
+- save 任务在另一个 CUDA stream 上 gather KV。
+- 为避免 gather 读到还没写完的数据，save stream 必须等 main stream event。
+
+后面 `_handle_save_task` 里会：
+
+```text
+with torch.cuda.stream(_save_stream):
+    _save_stream.wait_event(main_stream_event)
+    gather_kv_caches(...)
+    save_stream_event.record(_save_stream)
+```
+
+对应 `hf3fs_connector.py:300-308`。
+
+LocalSSD 对照：
+
+- LocalSSD `_save_one_block` 直接调用 gather，见
+  `local_ssd_connector.py:756-763`。
+- 它没有显式 CUDA event，因为它是同步学习实现，简单但对复杂 stream
+  时序的刻画不如 HF3FS 完整。
+
+## 7. _handle_save_task：完整 save 流水线
+
+`_handle_save_task` 是 HF3FS save 的核心，见 `hf3fs_connector.py:268-352`。
+
+它分四步：
+
+### Step 1：metadata server 分配 pages
+
+代码在 `hf3fs_connector.py:274-288`：
+
+- 把每个 block hash 变成 `(hash_val, "")`。
+- 调 `_metadata_client.allocate_pages_for_keys(rank, key_pairs)`。
+- 返回结果是每个 key 对应一个 `page_index`。
+- 如果有任何 `page_index < 0`，说明容量不足，任务失败。
+- offset = `page_index * bytes_per_page`。
+
+为什么要 metadata server 分配 page？
+
+- HF3FS 每个 rank 是一个大文件，而不是一个 block 一个文件。
+- 写入位置不能靠 hash 直接推导，需要一个中心元数据把 key 映射到 page。
+
+LocalSSD 对照：
+
+- LocalSSD 不分配 page。
+- 路径由 `_block_file_path(rank, block_hash)` 直接推导，见
+  `local_ssd_connector.py:722-730`。
+- 文件名就是地址，所以不需要 metadata server。
+
+### Step 2：分配 buffers 并 gather GPU KV
+
+代码在 `hf3fs_connector.py:290-308`：
+
+- `alloc_buffer(len(block_ids))` 从 buffer pool 取一批 device buffers。
+- save stream 等 main stream event。
+- `_gather_or_scatter_kv_caches(block_ids, buffers, "gather")` 把 paged KV cache
+  抽成连续 page buffers。
+- 记录 `save_stream_event`，告诉后续 `batch_write`：等 gather 完再写。
+
+LocalSSD 对照：
+
+- LocalSSD 每个 block 一个 `page_tensor`。
+- 调 `_gather_or_scatter_one_block(block_id, page_tensor, "gather")`。
+- 再把 tensor 转 bytes 写文件。
+
+HF3FS 的优势：
+
+- 一批 blocks 共用 buffer allocator。
+- gather 和 I/O 可以通过 event/线程池流水化。
+- 每批最多 `_max_device_buffer_count`，避免一次拿太多 GPU 临时内存。
+
+### Step 3：分批写 HF3FS
+
+代码在 `hf3fs_connector.py:310-326`：
+
+- 每 `DEFAULT_MAX_IO_ENTRIES = 8` 个 entries 分一个 I/O batch。
+- 通过 `AtomicCounter` round-robin 选择一个 `Hf3fsClient`。
+- 提交 `client.batch_write(batch_offsets, batch_buffers, save_stream_event)`。
+- 等所有 write futures 结果。
+- 每个 result 必须等于 `bytes_per_page` 才算成功。
+
+为什么要两层 batch？
+
+- `_max_device_buffer_count` 控制一次 async task 处理多少 blocks。
+- `DEFAULT_MAX_IO_ENTRIES` 控制一个 HF3FS io_uring batch 里多少 entries。
+- `_numjobs` 控制有多少 client/线程并行。
+
+LocalSSD 对照：
+
+- LocalSSD 是最内层循环里一个 block 一个文件写。
+- 没有 batch、没有 round-robin、没有 io_executor。
+
+### Step 4：confirm write
+
+代码在 `hf3fs_connector.py:328-345`：
+
+- 成功：`confirm_write_for_keys(rank, written_keys, [])`。
+- 失败：`confirm_write_for_keys(rank, [], page_indices)` 释放 pages。
+- 然后释放 buffers，并设置 future 结果。
+
+这个 confirm 是 HF3FS 设计里非常关键的一步：
+
+- 写文件成功前，metadata server 不应让 scheduler 认为 key 命中。
+- 所以先 allocate page，只是“占坑”。
+- 只有 confirm 后，这个 rank 的 key 才可见。
+- 所有 rank 都 confirm 后，`key_meta.is_complete()` 才返回 True。
+
+LocalSSD 对照：
+
+- LocalSSD 用 `tmp_path -> os.replace(path)` 做原子可见性，见
+  `local_ssd_connector.py:765-773`。
+- 文件一旦 replace 到最终路径，就代表这个 rank 写完。
+- scheduler 通过检查所有 rank 文件是否存在来判断完整性，见
+  `local_ssd_connector.py:732-745`。
+
+## 8. load 提交与执行
+
+HF3FS 的 load 从 `start_load_kv` 开始，见 `hf3fs_connector.py:641-662`。
+
+流程：
+
+1. 取 metadata。
+2. 遍历 request。
+3. 只处理有 `load_block_op` 的 request。
+4. `block_ids = request.block_ids[:num_blocks_to_load]`。
+5. 从 `num_computed_blocks` 开始生成对应 block hashes。
+6. 分批提交给 async manager。
+
+LocalSSD 对照：
+
+- LocalSSD 的 `start_load_kv` 直接同步读文件，见
+  `local_ssd_connector.py:332-358`。
+- HF3FS 这里只是提交任务，实际读和 scatter 在后台线程里。
+
+## 9. _handle_load_task：完整 load 流水线
+
+`_handle_load_task` 在 `hf3fs_connector.py:354-420`。
+
+### Step 1：查 page locations
+
+`hf3fs_connector.py:360-366`：
+
+- 调 metadata server：`get_key_locations(rank, block_hashes)`。
+- 如果任一 key 没有 page，任务失败。
+
+为什么 load 时还要查 location？
+
+- scheduler 侧只知道“这些 key complete”。
+- worker 侧还必须知道当前 rank 的 page index。
+- 同一个 key 在不同 rank 的 page index 可以不同。
+
+LocalSSD 对照：
+
+- LocalSSD 的 path 可直接由 `(rank, block_hash)` 推导。
+- 所以不需要额外查 location。
+
+### Step 2：分配 read buffers
+
+`hf3fs_connector.py:368-376`：
+
+- 从 `_load_buffer_allocator` 取 buffers。
+- 分配失败则 load 失败。
+
+LocalSSD 对照：
+
+- LocalSSD 读 bytes 后 `_bytes_to_tensor` 创建 page tensor，见
+  `local_ssd_connector.py:791-795`。
+- 没有固定 buffer pool。
+
+### Step 3：分批读 HF3FS
+
+`hf3fs_connector.py:378-395`：
+
+- page index 转 offsets。
+- 每 8 个 entries 一个 batch。
+- round-robin 选择 client。
+- `client.batch_read(batch_offsets, batch_buffers)`。
+- 所有 result 必须等于 `bytes_per_page`。
+
+LocalSSD 对照：
+
+- LocalSSD 只做 `open(path, "rb").read()`。
+- 它简单，但没有 HF3FS 的并行批量 I/O。
+
+### Step 4：scatter 回 GPU KV cache
+
+`hf3fs_connector.py:403-410`：
+
+- 在 `_load_stream` 上调用 `_gather_or_scatter_kv_caches(..., "scatter")`。
+- 然后 `_load_stream.synchronize()`。
+- 释放 load buffers。
+
+这里和 save 的一个差别：
+
+- save 只记录 event 给 HF3FS client 等待，不必同步 save stream。
+- load 必须同步 load stream，因为 forward 继续执行前需要 KV 已经写回 GPU。
+
+LocalSSD 对照：
+
+- LocalSSD load 也是读完后立刻 scatter。
+- 但 LocalSSD 没有单独 load stream，也没有后台线程。
+
+## 10. get_finished：request 级异步完成语义
+
+HF3FS `get_finished` 只是转发给 async manager，见 `hf3fs_connector.py:667-670`。
+
+`AsyncOperationManager.get_finished_operations` 在 `hf3fs_connector.py:192-205`：
+
+- `_check_completed_saves(finished_req_ids)`：只对已经 finished 的 request
+  检查 save 是否全部 done。
+- `_check_completed_loads()`：只要 load future done 就返回。
+
+注意：
+
+- save completion 是“request finished 之后，保存任务也完成了”。
+- load completion 是“后台 load future done”。
+- 当前实现只检查 `future.done()`，不检查 `future.result()` 是否 True。
+  所以“完成”不等于“成功”。失败通过日志和 metrics 体现。
+
+LocalSSD 对照：
+
+- LocalSSD 是同步读写，`get_finished` 返回 `(None, None)`，见
+  `local_ssd_connector.py:399-404`。
+- 这能帮助学习，但没有体现 vLLM connector 的异步 request 持有语义。
+
+## 11. scheduler-side：命中判断
+
+HF3FS 的 scheduler 命中入口是 `get_num_new_matched_tokens`，
+见 `hf3fs_connector.py:695-756`。
+
+它做的是“连续 prefix 命中”：
+
+1. 保存 request 到 `RequestSchedulingState`。
+2. `num_tokens_to_check = align(len(prompt_token_ids) - 1)`。
+3. 如果本地已计算 token 已经覆盖检查范围，返回 0。
+4. 对完整 prefix token blocks 生成 hashes。
+5. 调 metadata server `batch_key_exists`。
+6. 找第一个 False；前面连续 True 的 blocks 算命中。
+7. 记录 `LoadBlockInfo`。
+8. 返回 `new_hit_tokens` 和是否异步 load。
+
+为什么必须连续？
+
+- Transformer KV prefix reuse 依赖前缀连续。
+- 中间一个 block miss，后面的 block 即使存在也不能直接作为 prefix 命中。
+
+LocalSSD 对照：
+
+- LocalSSD 的逻辑几乎一模一样，见 `local_ssd_connector.py:423-483`。
+- 差别是 HF3FS 调 metadata server，LocalSSD 查本地文件是否存在。
+
+## 12. scheduler-side：分配后更新
+
+HF3FS `update_state_after_alloc` 在 `hf3fs_connector.py:758-781`。
+
+它发生在 scheduler 已经决定要从外部 KV load，并为这些 token 分配了 GPU
+block 之后。
+
+关键逻辑：
+
+- 如果 `num_external_tokens <= 0`，直接返回。
+- 校验实际分配 blocks 数等于之前命中的 blocks 数。
+- `blocks.get_unhashed_block_ids()` 取这些外部加载目标 block ids。
+- 写入 `state.load_op.need_fetch_block_ids`。
+- 把 phase 置为 `WAITING_TO_LOAD`。
+
+LocalSSD 对照：
+
+- LocalSSD 同样做这件事，见 `local_ssd_connector.py:485-508`。
+- 这部分是两个 connector 最相似的地方。
+
+## 13. scheduler-side：build_connector_meta
+
+HF3FS `build_connector_meta` 在 `hf3fs_connector.py:783-797`：
+
+1. 创建 `HF3FSConnectorMetadata()`。
+2. 清理 finished request state。
+3. 处理 waiting-to-load requests。
+4. 处理 scheduled_new_reqs。
+5. 处理 scheduled_cached_reqs。
+6. 返回 metadata 给 worker。
+
+它对应 vLLM 每个 engine step 的调度输出。
+
+LocalSSD 对照：
+
+- LocalSSD 同样拆成三个 helper，见 `local_ssd_connector.py:510-528`。
+- 这是故意照着 HF3FS 的结构写的，方便横向学习。
+
+## 14. waiting-to-load request 如何变成 metadata
+
+HF3FS `_process_waiting_to_load_requests` 在 `hf3fs_connector.py:799-828`。
+
+核心思路：
+
+- phase 必须是 `WAITING_TO_LOAD`。
+- 计算命中的总 block 数：
+  `num_computed_blocks + num_blocks_to_load`。
+- 只截取命中 prefix 对应的 token_ids。
+- `allocated_block_ids` 设成 scheduler 分配的 load 目标 blocks。
+- 调 `HF3FSRequestMetadata.from_scheduling_state`。
+- 加入 metadata，并把 phase 置为 `ACTIVE`。
+
+微妙点：
+
+- 这里传入 `skip_leading_blocks=num_cached_blocks`。
+- 这意味着生成 save metadata 时会跳过已经从 HF3FS 命中的前缀，不重复保存。
+- 同一个 request metadata 可能同时带有 load_op 和 save_op。
+
+LocalSSD 对照：
+
+- LocalSSD 的 `_process_waiting_load_requests` 完全类比这套逻辑，
+  见 `local_ssd_connector.py:530-561`。
+
+## 15. new request 如何保存
+
+HF3FS `_process_new_requests` 在 `hf3fs_connector.py:830-859`。
+
+它处理刚进入调度的新 request：
+
+- 根据 `request.num_computed_tokens + num_scheduled_tokens` 得出本步要计算的 token。
+- `_initialize_state_from_new_request` 把 token_ids 和 block_ids 放进 state。
+- 如果之前有 load_op，则计算 `num_cached_blocks` 用来跳过已命中前缀。
+- 调 `from_scheduling_state` 生成 save metadata。
+
+`_initialize_state_from_new_request` 在 `hf3fs_connector.py:941-953`。
+
+注意它对 `request.block_ids` 有一个兼容分支：
+
+- 如果 `request.block_ids[0]` 是 list，就取第一组。
+- 否则 copy 整个 `request.block_ids`。
+
+LocalSSD 对照：
+
+- LocalSSD 显式用 `_first_group_block_ids`，见
+  `local_ssd_connector.py:577-583`。
+- LocalSSD 还额外处理了多模态 hash，HF3FS 当前没有。
+
+## 16. cached request 如何增量保存
+
+HF3FS `_process_cached_requests` 在 `hf3fs_connector.py:861-887`。
+
+它处理已经在运行、这一 step 又生成了新 token/block 的 request：
+
+- 根据 request_id 找 state。
+- 从 `state.request.all_token_ids` 切出新增 tokens。
+- 取 `cached_reqs.new_block_ids[i]`。
+- `state.update_tokens_and_blocks` 追加 token/block。
+- `from_scheduling_state` 生成新增 save metadata。
+
+这里有个值得学习的点：
+
+- `state.num_saved_blocks` 会防止旧 blocks 重复保存。
+- save 是随着 request 逐步推进而增量发生的。
+
+LocalSSD 对照：
+
+- LocalSSD 的 `_process_cached_requests` 做了类似增量保存，
+  见 `local_ssd_connector.py:603-653`。
+- 我在 LocalSSD 里额外处理了 `resumed_req_ids`，因为 preemption 恢复时
+  `new_block_ids` 应替换整条 request 的 block 列表。
+
+## 17. HF3FSRequestMetadata：为什么同时有 load 和 save
+
+`HF3FSRequestMetadata` 定义在 `utils/common.py:90-128`。
+
+字段：
+
+- `request_id`
+- `token_ids`
+- `block_ids`
+- `load_block_op`
+- `save_block_op`
+
+`from_scheduling_state` 做两件事：
+
+- 判断有没有新增完整 block 要保存。
+- 如果有 load_op，即使没有新增 save，也要生成 metadata。
+
+关键逻辑在 `utils/common.py:117-127`：
+
+```text
+new_blocks_to_save = total_blocks - state.num_saved_blocks
+if new_blocks_to_save <= 0 and load_op is None:
+    return None
+state.num_saved_blocks = total_blocks
+return HF3FSRequestMetadata(..., load_block_op=load_op, save_block_op=...)
+```
+
+注意：只要返回 metadata，它总是带 `save_block_op`。
+
+这意味着：
+
+- worker 的 `start_load_kv` 会看 `load_block_op`。
+- worker 的 `wait_for_save` 会看 `save_block_op`。
+- 同一条 metadata 可驱动 load 和 save 两个方向。
+
+LocalSSD 对照：
+
+- LocalSSD 的 `LocalSSDRequestMetadata.from_state` 是照这个模式写的，
+  见 `local_ssd_connector.py:132-166`。
+
+## 18. block hash 设计
+
+HF3FS hash 生成在 `hf3fs_connector.py:955-982`。
+
+它按 block 链式生成：
+
+```text
+previous_hash = ""
+for token_block in prompt blocks:
+    block_hash = md5(f"{previous_hash}_{token_block}")
+    previous_hash = block_hash
+```
+
+好处：
+
+- hash_i 不只代表当前 block token，也代表此前所有 prefix。
+- 两个请求只有完整 prefix 一样，才会得到一样的后续 block hash。
+
+风险/限制：
+
+- 没有显式包含 model name。
+- 没有显式包含 tokenizer/config/dtype。
+- 没有包含 LoRA 或多模态特征。
+- 没有包含 TP layout 或 KV group。
+- 使用 md5 作为 key hash，虽然不是安全用途，但碰撞语义仍需意识到。
+
+LocalSSD 对照：
+
+- LocalSSD 的 `_compute_prefix_hash` 加入了 model、block_size、use_mla、
+  mm_hashes，并使用 sha256，见 `local_ssd_connector.py:699-716`。
+- 这是学习版里有意加的“更显式 namespace”。
+
+## 19. gather/scatter：从 paged KV 到连续 page
+
+HF3FS `_setup_kv_cache_config` 在 `hf3fs_connector.py:538-578`。
+
+它推导两个关键量：
+
+- `_shape_per_page`
+- `_bytes_per_page`
+
+MHA 时：
+
+```text
+first_cache shape: [2, num_blocks, block_size, num_heads, head_size]
+page shape: [num_layers, 2, block_size, num_heads * head_size]
+```
+
+MLA 时：
+
+```text
+first_cache shape: [num_blocks, block_size, head_size]
+page shape: [num_layers, block_size, head_size]
+```
+
+`_gather_or_scatter_kv_caches` 在 `hf3fs_connector.py:984-1005`：
+
+- 对每个 `(buffer_tensor, block_id)`：
+  - `start_idx = block_id * local_block_size`
+  - `token_indices = range(start_idx, start_idx + local_block_size)`
+  - gather：从 paged KV cache 取数据到 buffer
+  - scatter：从 buffer 写回 paged KV cache
+
+LocalSSD 对照：
+
+- LocalSSD 复用了 HF3FS 的 `gather_scatter_helper`。
+- LocalSSD 的 `_setup_kv_cache_shape` 对照 HF3FS 写法，见
+  `local_ssd_connector.py:289-330`。
+- LocalSSD 的 `_gather_or_scatter_one_block` 是 HF3FS 批量函数的单 block
+  版本，见 `local_ssd_connector.py:798-825`。
+
+## 20. metadata server：核心数据结构
+
+HF3FS metadata server 的状态在 `GlobalMetadataState`，
+见 `hf3fs_metadata_server.py:87-93`。
+
+它有两张表：
+
+```text
+rank_metadata: rank -> RankFileMetadata
+key_metadata: key -> KeyMetadata
+```
+
+`RankFileMetadata` 在 `hf3fs_metadata_server.py:34-59`：
+
+- `rank_id`
+- `num_pages`
+- `free_pages`
+
+它只管理单个 rank 的 page 空闲列表。
+
+`KeyMetadata` 在 `hf3fs_metadata_server.py:62-84`：
+
+- `key`
+- `rank_to_page`
+- `tp_world_size`
+
+它管理同一个 KV block key 在不同 rank 的 page index。
+
+最重要的是 `is_complete`：
+
+```text
+return len(rank_to_page) == tp_world_size
+```
+
+含义：
+
+- 一个 key 只有所有 TP ranks 都 confirm write 后才完整。
+- scheduler 命中时必须看到 complete key。
+
+LocalSSD 对照：
+
+- LocalSSD 没有内存 metadata 表。
+- `_block_exists_for_all_expected_ranks` 通过检查 rank 目录里的文件是否存在，
+  模拟 `is_complete`，见 `local_ssd_connector.py:732-745`。
+
+## 21. metadata server：allocate pages
+
+`allocate_pages_for_keys` 在 `hf3fs_metadata_server.py:111-156`。
+
+逻辑：
+
+1. 当前 rank 必须已经初始化。
+2. 从 `free_pages` 一次分配 `len(keys)` 个 pages。
+3. 遍历每个 key：
+   - 如果 key 已经 complete，且这个 rank 已有 page，复用老 page。
+   - 否则，如果有新分配 page，返回这个 page。
+   - 如果 page 不够，返回 -1。
+
+注意它先批量 allocate，再遇到“已有 complete key”时释放多分配的 page。
+
+这个设计让重复保存同一个 prefix block 时不会重复占空间。
+
+LocalSSD 对照：
+
+- LocalSSD 如果文件已存在且大小正确，直接跳过写，见
+  `local_ssd_connector.py:751-754`。
+- 这是文件版的“复用老 page”。
+
+## 22. metadata server：confirm write
+
+`confirm_write_for_keys` 在 `hf3fs_metadata_server.py:158-190`。
+
+逻辑：
+
+- 对成功写入的 `(key, page_index)`：
+  - 如果 key 不存在，创建 `KeyMetadata`。
+  - `tp_world_size = len(rank_metadata)`。
+  - 记录 `rank -> page_index`。
+- 对失败或不再需要的 pages：
+  - release 回当前 rank 的 free pool。
+
+关键点：
+
+- `tp_world_size` 是创建 key metadata 时根据已初始化 ranks 数量决定的。
+- 如果 rank 初始化时机不一致，理论上会影响 complete 判断。
+- 因此 HF3FS metadata server 最好在所有 worker rank 初始化完成后再进入稳定使用。
+
+LocalSSD 对照：
+
+- LocalSSD 不需要 confirm API。
+- 它通过 `os.replace(tmp, final)` 把“写完”变成文件系统可见事件。
+
+## 23. metadata server：exists 和 locations
+
+`batch_key_exists` 在 `hf3fs_metadata_server.py:192-210`：
+
+- key 不存在：False。
+- key 存在：返回 `key_meta.is_complete()`。
+
+`get_key_locations` 在 `hf3fs_metadata_server.py:212-239`：
+
+- key 不存在：None。
+- key 存在但未 complete：None。
+- key complete：返回当前 rank 的 page index。
+
+这两个 API 分别服务两端：
+
+- scheduler：只问“是否能作为 prefix 命中”。
+- worker：问“我这个 rank 应该从哪个 page offset 读”。
+
+LocalSSD 对照：
+
+- scheduler exists：检查所有 rank 文件是否存在。
+- worker location：直接由 rank/hash 推导 path。
+
+## 24. metadata client：HTTP 包装层
+
+`Hf3fsGlobalMetadataClient` 在 `hf3fs_metadata_server.py:431-507`。
+
+它是 metadata server 的同步 HTTP client：
+
+- `requests.Session`
+- `Retry(total=max_retries, status_forcelist=[500, 502, 503, 504])`
+- `_post(endpoint, json_data)`
+
+公开方法：
+
+- `initialize`
+- `allocate_pages_for_keys`
+- `confirm_write_for_keys`
+- `batch_key_exists`
+- `get_key_locations`
+
+LocalSSD 对照：
+
+- LocalSSD 省掉这层，因此调试简单。
+- 但 LocalSSD 也因此只能依赖共享文件系统语义，无法集中做 page 分配、
+  page 回收、完整性元数据和跨 rank 一致性控制。
+
+## 25. Hf3fsClient：为什么不是普通 read/write
+
+真实 HF3FS client 在 `hf3fs_client.py:61-298`。
+
+初始化时做很多资源准备，见 `hf3fs_client.py:90-146`：
+
+- 打开/创建 rank-local 大文件。
+- `ftruncate` 到固定大小。
+- `register_fd`。
+- 创建 read/write shared memory。
+- 创建 pinned CPU tensors。
+- 创建 read/write io_uring。
+- 创建 iovec。
+- 创建 CUDA stream。
+
+为什么这么复杂？
+
+因为目标不是“能读写”，而是“高吞吐地把 GPU tensor 数据通过 HF3FS 读写”。
+
+普通文件写路径通常是：
+
+```text
+GPU tensor -> CPU bytes -> write(fd)
+```
+
+HF3FS client 的路径更像：
+
+```text
+GPU tensor
+  -> pinned CPU / shared memory bridge
+  -> HF3FS iovec
+  -> HF3FS io_uring batch submit
+```
+
+LocalSSD 对照：
+
+- LocalSSD 直接 `tensor.cpu().numpy().tobytes()`。
+- 简单清楚，但会同步阻塞且不适合高吞吐。
+
+## 26. Hf3fsClient batch_read
+
+`batch_read` 在 `hf3fs_client.py:185-220`。
+
+流程：
+
+1. `check(offsets, tensors)` 验证边界。
+2. 对每个 `(offset, tensor)`：
+   - 计算 size。
+   - `ior_r.prepare(iovec slice, True, file, offset)`。
+3. `ior_r.submit().wait(min_results=ionum)`。
+4. `hf3fs_utils.read_shm(...)` 把 shared memory 里的数据转到目标 tensors。
+5. 返回每个 entry 的 result 字节数。
+
+LocalSSD 对照：
+
+- LocalSSD `_load_one_block` 一次读取一个文件，见
+  `local_ssd_connector.py:775-796`。
+- HF3FS 一次 batch 读多个 page offsets。
+
+## 27. Hf3fsClient batch_write
+
+`batch_write` 在 `hf3fs_client.py:222-262`。
+
+流程：
+
+1. `check` 边界验证。
+2. 在 client 自己的 CUDA stream 上等待 save stream event。
+3. `hf3fs_utils.write_shm(...)` 把 tensors 复制到 write shared memory。
+4. 对每个 `(offset, tensor)` prepare write iovec。
+5. `ior_w.submit().wait(min_results=ionum)`。
+6. 返回 result 字节数。
+
+LocalSSD 对照：
+
+- LocalSSD `_save_one_block` 把一个 tensor 转 bytes，再写一个文件。
+- HF3FS client 可以一次写多个 offsets，并且和 CUDA event 串联。
+
+## 28. 并发模型全景
+
+HF3FS save 并发：
+
+```text
+wait_for_save
+  -> submit_save_operation
+    -> save_queue
+      -> _save_thread
+        -> gather on save_stream
+        -> io_executor.submit(client.batch_write)
+          -> Hf3fsClient.write_shm + ioring write
+        -> confirm metadata
+```
+
+HF3FS load 并发：
+
+```text
+start_load_kv
+  -> submit_load_operation
+    -> load_queue
+      -> _load_thread
+        -> metadata get locations
+        -> io_executor.submit(client.batch_read)
+          -> ioring read + read_shm
+        -> scatter on load_stream
+        -> synchronize
+```
+
+LocalSSD 对照：
+
+```text
+wait_for_save
+  -> for request
+    -> for block
+      -> gather
+      -> write file
+
+start_load_kv
+  -> for request
+    -> for block
+      -> read file
+      -> scatter
+```
+
+这就是“生产吞吐复杂度”和“学习可读性”的核心取舍。
+
+## 29. 容量模型
+
+HF3FS：
+
+- 每个 rank 一个固定大文件：
+  `hf3fs_vllm_data_file_<rank>`，见 `hf3fs_connector.py:580-586`。
+- `num_pages = file_size // bytes_per_page`，见 `hf3fs_connector.py:602-605`。
+- metadata server 管每个 rank 的 `free_pages`。
+- page 不够时 allocate 返回 -1，save 失败。
+- 当前代码没有 LRU eviction，也没有 TTL 回收。
+
+LocalSSD：
+
+- 一个 block 一个文件。
+- 没有容量上限。
+- 不做驱逐。
+- 文件越来越多，靠用户清理目录。
+
+两者都不是 CPU manager 那种严格 cache replacement。
+
+## 30. 正确性和可见性模型
+
+HF3FS 的可见性：
+
+- allocate page 不代表可见。
+- write 成功后 confirm。
+- 所有 ranks confirm 后 complete。
+- scheduler 只认 complete。
+
+LocalSSD 的可见性：
+
+- 写 tmp 文件期间不可见。
+- `os.replace(tmp, final)` 后可见。
+- scheduler 看到所有 rank 的 final 文件就认为 complete。
+
+二者都试图避免“读到半写数据”：
+
+- HF3FS 靠 metadata confirm。
+- LocalSSD 靠 tmp + atomic replace。
+
+## 31. request_finished 语义
+
+HF3FS `request_finished` 返回 `(True, None)`，见 `hf3fs_connector.py:688-693`。
+
+含义：
+
+- connector 可能还在异步保存这个 request 的 KV。
+- scheduler 不应立即把这个 request 当作完全完成释放。
+- 后续 `get_finished` 会告诉哪些 request 的 save 完成。
+
+LocalSSD `request_finished` 返回 `(False, None)`，见
+`local_ssd_connector.py:411-421`。
+
+含义：
+
+- 没有异步保存。
+- 不接管 block 释放。
+
+这是异步 connector 和同步 connector 在 vLLM 生命周期里的重要区别。
+
+## 32. 指标
+
+HF3FS stats 在 `hf3fs_connector.py:1019-1107`：
+
+- `save_duration`
+- `load_duration`
+- `num_failed_save`
+- `num_failed_load`
+- `num_transfer_task`
+
+Prom metrics 在 `hf3fs_connector.py:1110-1195`：
+
+- `vllm:hf3fs_save_duration_seconds`
+- `vllm:hf3fs_load_duration_seconds`
+- `vllm:hf3fs_num_failed_save`
+- `vllm:hf3fs_num_failed_load`
+
+LocalSSD：
+
+- 目前没有 metrics。
+- 因为是学习 connector，重点是理解流程。
+
+如果要把 LocalSSD 往生产方向改，第一步可以加：
+
+- save/load latency
+- bytes read/write
+- cache hit/miss count
+- load error count
+
+## 33. HF3FS 相比 LocalSSD 多出来的设计价值
+
+HF3FS 多出来的复杂度主要买到了这些东西：
+
+- 固定大文件，减少海量小文件问题。
+- page allocation，由 metadata server 集中管理。
+- 所有 TP ranks complete 后才命中。
+- 多 client + thread pool + io_uring 批量 I/O。
+- CUDA stream/event 管理 gather/write 顺序。
+- buffer pool 减少频繁 GPU tensor 分配。
+- request finished 后异步保存，不阻塞主流程。
+- 统一 metrics。
+
+LocalSSD 刻意砍掉这些：
+
+- 用一个 block 一个文件换取可读性。
+- 用同步读写换取容易调试。
+- 用文件存在性替代 metadata server。
+- 用每次分配 page tensor 替代 buffer pool。
+
+## 34. HF3FS 当前实现里值得注意的点
+
+这些不是批评，而是学习源码时要特别有数：
+
+1. `_metadata_server_url` 被读取但没有传给 `Hf3fsMetadataClient`
+
+   `HF3FSKVConnector.__init__` 读了 extra config，见
+   `hf3fs_connector.py:498-500`，但创建 client 时是
+   `Hf3fsMetadataClient()`，默认 base URL 仍是 localhost，见
+   `hf3fs_connector.py:512-515` 和 `hf3fs_metadata_server.py:434-435`。
+
+2. `HF3FS_AVAILABLE` fallback 很宽
+
+   `except Exception` 会吞掉真实 import 过程里的多种错误。学习时要知道：
+   进入 mock client 不一定只是没装 hf3fs，也可能是真 client import 中别的异常。
+
+3. future done 不等于 transfer success
+
+   `_check_completed_loads` / `_check_completed_saves` 只看 `.done()`。
+   `_fail_task` 设置的是 `future.set_result(False)`，不会阻止 done。
+
+4. hash namespace 偏简化
+
+   当前 hash 只用 previous hash 和 token_ids，见 `hf3fs_connector.py:1007-1012`。
+   多模型、多 LoRA、多模态或不同 KV layout 共享同一 metadata namespace 时要小心。
+
+5. page 回收不足
+
+   metadata server 有 `release_pages`，但主要用于失败或重复 complete key。
+   没有 LRU/TTL/删除旧 key 的主流程。
+
+6. HMA/多 group 支持有限
+
+   HF3FS 代码里多处只取一组 block ids 的语义。学习时先按单 attention KV
+   group 理解，不要一开始就套复杂 hybrid model。
+
+## 35. 从 LocalSSD 改到 HF3FS 的演进路线
+
+如果你把 LocalSSD 当第一版，HF3FS 可以理解成以下演进：
+
+1. 文件命名地址
+
+   LocalSSD：
+
+   ```text
+   key -> rank/key.bin
+   ```
+
+   HF3FS：
+
+   ```text
+   key -> metadata server -> rank/page_index -> big_file offset
+   ```
+
+2. 同步 I/O
+
+   LocalSSD：
+
+   ```text
+   forward hook 里直接读写
+   ```
+
+   HF3FS：
+
+   ```text
+   forward hook 里提交任务
+   后台线程 + io_executor 读写
+   get_finished 汇报完成
+   ```
+
+3. 单 block I/O
+
+   LocalSSD：
+
+   ```text
+   for block: read/write one file
+   ```
+
+   HF3FS：
+
+   ```text
+   task batch -> io entry batch -> multi client round-robin
+   ```
+
+4. 文件可见性
+
+   LocalSSD：
+
+   ```text
+   os.replace 后可见
+   ```
+
+   HF3FS：
+
+   ```text
+   write 成功后 confirm metadata
+   所有 rank confirm 后 complete
+   ```
+
+5. 临时 buffer
+
+   LocalSSD：
+
+   ```text
+   每次 torch.empty 一个 page
+   ```
+
+   HF3FS：
+
+   ```text
+   CopyBufferAllocator 预分配/复用一批 page buffers
+   ```
+
+## 36. 建议你按这个顺序读源码
+
+第一遍，只看主流程：
+
+1. `HF3FSKVConnector.__init__`
+2. `register_kv_caches`
+3. `get_num_new_matched_tokens`
+4. `update_state_after_alloc`
+5. `build_connector_meta`
+6. `start_load_kv`
+7. `wait_for_save`
+
+第二遍，看 worker 异步细节：
+
+1. `AsyncOperationManager.__init__`
+2. `submit_save_operation`
+3. `_handle_save_task`
+4. `submit_load_operation`
+5. `_handle_load_task`
+6. `get_finished_operations`
+
+第三遍，看 metadata server：
+
+1. `RankFileMetadata`
+2. `KeyMetadata`
+3. `GlobalMetadataState.allocate_pages_for_keys`
+4. `confirm_write_for_keys`
+5. `batch_key_exists`
+6. `get_key_locations`
+
+第四遍，看 HF3FS client：
+
+1. `Hf3fsClient.__init__`
+2. `batch_write`
+3. `batch_read`
+4. `check`
+5. `_release_resources`
+
+第五遍，对照 LocalSSD：
+
+1. `LocalSSDConnector.get_num_new_matched_tokens`
+2. `LocalSSDConnector.build_connector_meta`
+3. `LocalSSDConnector.start_load_kv`
+4. `LocalSSDConnector.wait_for_save`
+5. `LocalSSDConnector._save_one_block`
+6. `LocalSSDConnector._load_one_block`
+
+## 37. 心智模型总结
+
+HF3FSConnector 的本质：
+
+```text
+它不是“把 KV 写进一个文件”这么简单。
+它是一个 request-prefix KV store：
+
+scheduler 负责问：哪些 prefix block 已经全 rank 可用？
+metadata server 负责答：key 是否 complete？每个 rank 在哪个 page？
+worker 负责做：GPU paged KV <-> 连续 page buffer <-> HF3FS 大文件 offset。
+async manager 负责把这些搬运变成后台任务和批量 I/O。
+```
+
+LocalSSDConnector 的本质：
+
+```text
+它是 HF3FS 思路的最小可读版：
+
+去掉 metadata server，用文件路径当元数据；
+去掉大文件 page allocator，用一个 block 一个文件；
+去掉异步线程和 io_uring，用同步 open/read/write；
+保留 scheduler metadata、prefix hash、gather/scatter 这条主线。
+```
+
+你掌握 LocalSSD 后，再看 HF3FS，真正需要补上的就是：
+
+- page allocator
+- complete metadata
+- async task tracking
+- CUDA stream/event synchronization
+- batched high-performance file I/O
+
