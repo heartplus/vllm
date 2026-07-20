@@ -1,0 +1,582 @@
+# CPUOffloadingManager vs HF3FSKVConnector 对比学习笔记
+
+本文对比两个入口：
+
+- `vllm/v1/kv_offload/cpu/manager.py`
+- `vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/`
+
+结论先放前面：它们都在解决“KV cache 放到 GPU 之外并在命中时取回”的问题，但抽象层级不同。
+
+- `CPUOffloadingManager` 是 `OffloadingManager` 的 scheduler-side 管理器。它不直接搬 KV 数据，只负责 CPU offload 介质里的 key -> CPU block slot 映射、引用计数、ready/pending 状态、容量和驱逐。
+- `HF3FSKVConnector` 是完整的 `KVConnectorBase_V1` connector。它同时包含 scheduler-side 匹配/metadata 生成，以及 worker-side gather/scatter、HF3FS 文件 I/O、metadata server 交互、后台线程和指标。
+- CPU manager 更像“本机 CPU cache 的 cache controller”；HF3FS 更像“一个基于共享文件系统和全局元数据服务的远端/外部 KV transfer backend”。
+
+## 1. 源码位置和抽象层级
+
+### CPUOffloadingManager
+
+`CPUOffloadingManager` 继承 `OffloadingManager`，核心接口是：
+
+- `lookup`
+- `prepare_load` / `complete_load`
+- `prepare_store` / `complete_store`
+- `touch`
+- `reset_cache`
+- `take_events`
+- `get_stats`
+
+代码位置：`vllm/v1/kv_offload/cpu/manager.py:37`。
+
+它通常不是被 vLLM 直接当作 `KVConnectorBase_V1` 使用，而是经由：
+
+- `CPUOffloadingSpec` 创建 manager 和 worker：`vllm/v1/kv_offload/cpu/spec.py`
+- `OffloadingConnector` 把 `OffloadingSpec` 包装成 v1 connector：`vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py`
+
+所以它在架构上位于：
+
+```text
+KVConnectorBase_V1
+  -> OffloadingConnector
+    -> OffloadingConnectorScheduler
+      -> CPUOffloadingManager
+    -> OffloadingConnectorWorker
+      -> CPUOffloadingWorker
+```
+
+### HF3FSKVConnector
+
+`HF3FSKVConnector` 直接继承 `KVConnectorBase_V1`，代码位置：`vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:469`。
+
+它内部同时拥有：
+
+- scheduler-side state：`_scheduling_states`
+- worker-side KV cache pointer、HF3FS client、后台异步任务
+- 独立 metadata server client
+- 自定义 metrics
+
+架构上更像：
+
+```text
+KVConnectorBase_V1
+  -> HF3FSKVConnector
+    -> scheduler role: prefix hash lookup + connector metadata
+    -> worker role: async save/load + gather/scatter + HF3FS file I/O
+    -> metadata server: key -> rank/page 映射
+```
+
+## 2. 共同目标
+
+两者都服务于 vLLM v1 KV transfer/offload：
+
+- 复用已经计算过的 prompt prefix KV cache。
+- 让 GPU KV cache 压力降低。
+- 在调度器侧判断某些 token/block 是否能从外部介质加载。
+- 在 worker 侧把 KV cache 从 GPU 搬到外部介质，或从外部介质搬回 GPU。
+- 支持异步行为，避免热路径完全阻塞在 I/O 或 copy 上。
+
+但是“外部介质”的语义不同：
+
+- CPU manager 的介质是本机 CPU 内存，通常是进程内或同机共享 mmap/pinned CPU buffer。
+- HF3FS 的介质是 HF3FS 文件系统上的 rank-local data file，并由 metadata server 管理 key 到 page 的映射。
+
+## 3. 核心数据模型对比
+
+| 维度 | CPUOffloadingManager | HF3FSKVConnector |
+|---|---|---|
+| key 类型 | `OffloadKey`，本质是 bytes，包含 block hash + group index | md5 字符串，由 token block 和 previous hash 链式生成 |
+| value/address | `BlockStatus(block_id, ref_cnt)`，block_id 是 CPU offload slot | metadata server 里的 `(rank, page_index)`，worker 用 `page_index * bytes_per_page` 定位文件 offset |
+| block ready 状态 | `ref_cnt == -1` 表示正在 store，`>=0` 表示 ready | metadata server 中 key complete 才可命中；要求所有 TP ranks 都 confirm write |
+| 容量模型 | 固定 `num_blocks`，manager 本地分配 slot | 每 rank 一个固定大小文件，`file_size // bytes_per_page` 个 page |
+| 驱逐模型 | 显式 LRU/ARC 驱逐，可复用 CPU slot | 基本没有热路径驱逐；page 分配失败则 save 失败 |
+| 请求状态 | manager 几乎不存 request state，更多是 key-level cache state | `RequestSchedulingState` 维护 token_ids、allocated_block_ids、num_saved_blocks、phase、load_op |
+
+CPU manager 的核心状态在初始化中可以看到：`_num_blocks`、`_num_allocated_blocks`、`_free_list`、`_policy`、`_num_evictable_cache_blocks`、可选 `counts`，见 `manager.py:47-78`。
+
+HF3FS scheduler 状态是每 request 的 `RequestSchedulingState`，见 `utils/common.py:44-68`；worker 地址状态在 `_setup_kv_cache_config` 和 `_setup_storage_clients` 里建立，见 `hf3fs_connector.py:532-605`。
+
+## 4. 命中路径对比
+
+### CPU manager 的命中
+
+`lookup(key)` 直接查本地 cache policy：
+
+1. 如果启用 `store_threshold >= 2`，先更新 key 访问计数。
+2. `_policy.get(key)` 找不到则 `MISS`。
+3. 找到但 `block.is_ready == False` 则 `HIT_PENDING`。
+4. 找到且 ready 则 `HIT`。
+
+对应代码：`manager.py:118-132`。
+
+这个设计非常 cache-controller：命中判断只依赖本地内存里的 metadata，不做网络调用，不读外部文件。
+
+### HF3FS 的命中
+
+`get_num_new_matched_tokens(request, num_computed_tokens)` 的粒度是 request prefix：
+
+1. 把 prompt token 数对齐到 block size，且排除最后一个 token：`hf3fs_connector.py:704-717`。
+2. 对完整 token blocks 生成 prefix hash。
+3. 调 metadata server 的 `batch_key_exists`。
+4. 从头数连续存在的 blocks；中间遇到第一个不存在就停止。
+5. 返回可新增加载的 token 数，并记录 `LoadBlockInfo`。
+
+对应代码：`hf3fs_connector.py:695-756`。
+
+HF3FS 命中不是单 key 查询，而是“这个请求最多有多长连续 prefix 可从 HF3FS 加载”。这和 prefix caching 的使用方式更贴近，但也意味着 metadata server 是调度热路径依赖。
+
+## 5. load 路径对比
+
+### CPU manager load
+
+CPU manager 只做调度准备：
+
+1. `prepare_load(keys)` 找到每个 block。
+2. 如果 block 的 `ref_cnt == 0`，从 evictable 列表移出，避免 load 期间被驱逐。
+3. `ref_cnt += 1`。
+4. 返回 `CPULoadStoreSpec([block_id...])`，让 worker 知道从哪些 CPU slots 读。
+5. `complete_load(keys)` 把 `ref_cnt -= 1`，降回 0 时重新变成 evictable。
+
+对应代码：`manager.py:134-168`。
+
+真正搬运由 `CPUOffloadingWorker` 做，worker 用 CPU tensors 和 GPU tensors 执行 CPU->GPU copy。manager 自身完全不碰 torch tensor。
+
+### HF3FS load
+
+HF3FS 的 load 包含 scheduler 和 worker 两段：
+
+Scheduler 段：
+
+1. `get_num_new_matched_tokens` 发现可加载 blocks。
+2. `update_state_after_alloc` 在 GPU block 分配后记录要 scatter 的 block ids，并把 request phase 置为 `WAITING_TO_LOAD`，见 `hf3fs_connector.py:758-781`。
+3. `build_connector_meta` 把 waiting request 转成 `HF3FSRequestMetadata`，见 `hf3fs_connector.py:783-828`。
+
+Worker 段：
+
+1. `start_load_kv` 从 metadata 中取 `block_ids` 和 `block_hashes`，提交异步 load，见 `hf3fs_connector.py:641-662`。
+2. 后台 `_handle_load_task` 向 metadata server 查 page locations，见 `hf3fs_connector.py:354-366`。
+3. 分配 GPU-side temporary buffers。
+4. 用多个 HF3FS clients 分批 `batch_read`。
+5. 读成功后把 buffers scatter 回 vLLM paged KV cache。
+
+这条路径比 CPU manager 厚很多，因为 HF3FS connector 自己拥有数据移动、I/O、线程池和 metadata server 交互。
+
+## 6. store 路径对比
+
+### CPU manager store
+
+`prepare_store(keys)` 的核心是 cache slot 分配和驱逐：
+
+1. 如果启用了 `store_threshold`，过滤掉未达到复用阈值的 key：`manager.py:176-179`。
+2. 跳过已经存在的 key：`manager.py:180-181`。
+3. 计算是否需要驱逐：`len(keys_to_store) - free_blocks`。
+4. 如果可驱逐数量不足，返回 `None`，表示本次不能 store。
+5. 调 cache policy 驱逐，释放 block slot。
+6. 分配新 block，并插入 policy。新插入的 `BlockStatus` 初始 `ref_cnt = -1`，表示 store pending。
+7. 返回 `PrepareStoreOutput(keys_to_store, store_spec, evicted_keys)`。
+
+对应代码：`manager.py:170-240`。
+
+`complete_store(keys, success=True)` 决定 pending block 的命运：
+
+- 成功：`ref_cnt = 0`，加入 evictable。
+- 失败：从 policy 删除，并把 slot 放回 free list。
+
+对应代码：`manager.py:242-273`。
+
+### HF3FS store
+
+HF3FS store 由 request progress 触发：
+
+1. Scheduler 对新请求和 cached request 累积 token_ids/block_ids。
+2. `HF3FSRequestMetadata.from_scheduling_state` 通过 `num_saved_blocks` 只保存新增完整 blocks，见 `utils/common.py:100-128`。
+3. Worker 的 `wait_for_save` 并不真正 wait，而是遍历 metadata、计算 block hashes、提交后台 save operation，见 `hf3fs_connector.py:620-639`。
+4. `_handle_save_task` 先向 metadata server allocate pages，见 `hf3fs_connector.py:274-288`。
+5. 在 CUDA stream 上 gather KV cache 到中间 buffers，见 `hf3fs_connector.py:290-308`。
+6. 用线程池和多个 HF3FS client 分批写 HF3FS 文件，见 `hf3fs_connector.py:310-326`。
+7. 成功后 `confirm_write_for_keys`；失败则释放分配的 page，见 `hf3fs_connector.py:328-345`。
+
+一个很重要的差异：CPU manager 是先占一个 CPU slot，然后等待 worker 填充；HF3FS 是先向 metadata server 要 page，再把数据写到文件，最后确认 key 可见。
+
+## 7. 容量、驱逐和缓存策略
+
+### CPU manager：显式 cache replacement
+
+CPU manager 支持可插拔 cache policy：
+
+- LRU：`vllm/v1/kv_offload/cpu/policies/lru.py`
+- ARC：`vllm/v1/kv_offload/cpu/policies/arc.py`
+
+LRU 有一个 `evictable_blocks` OrderedDict，只放 `ref_cnt == 0` 的 blocks。
+
+ARC 有 T1/T2/B1/B2 和 `target_t1_size`，用于在 recency 和 frequency 之间自适应。它在 `touch` 中做 T1->T2 promote 或调整 ghost list，见 `arc.py:75-101`；在 `evict` 中按 target 从 T1/T2 选可驱逐 blocks，见 `arc.py:111-171`。
+
+CPU manager 的驱逐有几个关键不变量：
+
+- in-flight load 的 blocks 通过 `ref_cnt > 0` 保护。
+- in-flight store 的 blocks 通过 `ref_cnt == -1` 表示还不可读，也不可驱逐。
+- `prepare_store` 里的 `protected = set(keys)` 保证同一次 store 输入中已经存在的 key 不会被本次驱逐掉。
+- 如果无法原子地驱逐足够多 blocks，就返回 `None`。
+
+### HF3FS：page allocation，而不是 cache replacement
+
+HF3FS metadata server 为每个 rank 管理 free pages：`RankFileMetadata.free_pages`，见 `hf3fs_metadata_server.py:34-59`。
+
+保存时调用 `allocate_pages_for_keys`：
+
+- 每个 key/rank 分配一个 page。
+- 如果 key 已经 complete 且当前 rank 有 page，则复用现有 page，并把刚分配的 page 释放回 free pool。
+- 如果 page 不够，该 key 返回 `-1`。
+
+对应代码：`hf3fs_metadata_server.py:111-156`。
+
+HF3FS 当前实现没有类似 CPU manager 的 LRU/ARC 驱逐，也没有“删除旧 key 释放 page”的热路径。容量满时 save 会失败。它更像 append/update 型外部 KV store，而不是严格意义上的有限容量 cache controller。
+
+## 8. 并发和异步模型
+
+### CPU manager
+
+CPU manager 本身基本是同步的 scheduler-side metadata 操作。异步体现在：
+
+- scheduler 创建 transfer job。
+- worker 异步执行 GPU<->CPU copy。
+- worker 完成后 scheduler 调 `complete_load` / `complete_store`。
+
+它的并发保护主要靠 ref count 和 scheduler/job 生命周期，而不是 manager 内部线程。
+
+### HF3FS
+
+HF3FS 内部有一套显式异步系统：
+
+- `AsyncOperationManager` 创建 save/load CUDA streams、buffer allocators、worker threads、I/O thread pool，见 `hf3fs_connector.py:101-169`。
+- save/load 各有 queue 和后台 thread。
+- 真正 HF3FS `batch_read`/`batch_write` 被提交到 `ThreadPoolExecutor`。
+- 多个 `Hf3fsClient` 通过 `AtomicCounter` round-robin 使用，见 `utils/common.py:11-25` 和 `hf3fs_connector.py:589-600`。
+- `get_finished` 根据 request_id 聚合 save/load futures，见 `hf3fs_connector.py:192-238`。
+
+HF3FS 并发粒度更细：request -> batch -> I/O entries -> client thread pool。
+
+## 9. 数据搬运方式
+
+### CPU offload
+
+CPU offload worker 把 canonicalized KV tensors 视为 block-major int8 pages，再用 `swap_blocks_batch` 或 Triton kernel 在 GPU 和 CPU tensors 之间 copy。CPU backing 可以是 `SharedOffloadRegion` mmap，并可用 `cudaHostRegister` pin 住，见 `vllm/v1/kv_offload/cpu/shared_offload_region.py` 和 `gpu_worker.py`。
+
+特点：
+
+- 存储格式贴近 vLLM canonical KV block。
+- 通过 block_id 寻址。
+- CPU 内存可被 secondary tier 继续使用，因此 tiering 设计能复用它。
+
+### HF3FS
+
+HF3FS worker 先把每个 block 的所有 layers gather 到 temporary buffer，再写入 HF3FS file page：
+
+- MHA page shape：`[num_layers, 2, block_size, num_heads * head_size]`
+- MLA page shape：`[num_layers, block_size, head_size]`
+
+对应代码：`hf3fs_connector.py:538-578`。
+
+HF3FS client 使用：
+
+- `hf3fs_fuse.io` 的 `make_ioring` / `make_iovec`
+- shared memory buffer
+- pinned CPU tensor
+- C++ extension `hf3fs_utils.read_shm/write_shm`
+
+对应代码：`hf3fs_client.py:14-20`、`hf3fs_client.py:91-146`、`hf3fs_client.py:185-262`。
+
+## 10. scheduler 和 worker 责任边界
+
+| 责任 | CPU manager 路线 | HF3FS 路线 |
+|---|---|---|
+| scheduler 判断是否命中 | `OffloadingConnectorScheduler` 调 `CPUOffloadingManager.lookup` | `HF3FSKVConnector.get_num_new_matched_tokens` 直接查 metadata server |
+| scheduler 生成 worker metadata | `OffloadingConnectorScheduler` 生成 load/store jobs 和 `LoadStoreSpec` | `HF3FSKVConnector.build_connector_meta` 生成 `HF3FSRequestMetadata` |
+| worker 搬数据 | `OffloadingConnectorWorker` 调 `CPUOffloadingWorker.submit_load/store` | `HF3FSKVConnector` 自己的 async manager + HF3FS client |
+| worker 完成回传 | `OffloadingWorkerMetadata` 回 scheduler，scheduler 调 `complete_*` | worker `get_finished` 直接返回 request-level save/load completion |
+| key 生命周期 | manager 明确维护 ready/ref/evictable | metadata server 维护 complete/page 映射 |
+
+CPU 路线拆得更分层、更可组合；HF3FS 路线更“端到端一体化”。
+
+## 11. request 生命周期对比
+
+### CPU manager
+
+CPU manager 本身几乎不关心 request 生命周期。它只在 `on_new_request` 返回默认 `RequestOffloadingContext`，见 `manager.py:113-115`。
+
+request 级的状态主要在 `OffloadingConnectorScheduler` 中，包括 request 的 block hashes、transfer jobs、pending store/load 等。
+
+### HF3FS
+
+HF3FS 直接维护 request state：
+
+- `NEW`
+- `WAITING_TO_LOAD`
+- `ACTIVE`
+- `FINISHED`
+
+状态字段见 `utils/common.py:44-68`。
+
+`build_connector_meta` 每步做三类处理：
+
+- waiting-to-load requests：生成 load + save metadata
+- new requests：初始化 state 并生成 save metadata
+- cached requests：追加新 token/block 并生成 save metadata
+
+对应代码：`hf3fs_connector.py:783-887`。
+
+这说明 HF3FS 的 scheduler 部分已经把 request 状态机和 KV store 策略耦合在 connector 内部。
+
+## 12. key 设计和正确性语义
+
+### CPU manager 的 OffloadKey
+
+`OffloadKey` 是 bytes，包含 block hash 和 group index。它依赖上层 scheduler 已经按 vLLM 的 block hash 规则生成 key。好处是：
+
+- 适配 hybrid KV cache groups。
+- 同一 token prefix 在不同 KV group 可映射到不同 offload entry。
+- manager 不需要知道 token_ids。
+
+### HF3FS 的 prefix hash
+
+HF3FS 自己从 token_ids 生成 md5 prefix hash：
+
+```text
+hash_i = md5(f"{hash_{i-1}}_{token_block_i}")
+```
+
+对应代码：`hf3fs_connector.py:955-1012`。
+
+这个设计很直观，但有几个学习时要留意的点：
+
+- 它没有把 model identity、dtype、parallel layout、KV group、LoRA/adapters 等信息显式放进 hash。
+- `md5` 用于 keying，不是加密安全用途。
+- 当前 `block_hashes` 是 connector 自己算的，而不是复用 `Request.block_hashes`。
+- metadata server 的 complete 判断要求所有已初始化 ranks 都写入同一 key，见 `hf3fs_metadata_server.py:82-84`、`hf3fs_metadata_server.py:192-210`。
+
+这意味着 HF3FS 的正确性强依赖部署环境中“同一个 metadata namespace 下的请求语义一致”。
+
+## 13. 故障语义
+
+### CPU manager
+
+CPU manager 的失败路径比较明确：
+
+- `prepare_store` 容量不足或无法驱逐时返回 `None`。
+- store 成功后 `complete_store(..., success=True)` 使 block ready。
+- store 失败时 `complete_store(..., success=False)` 删除 pending block 并释放 slot。
+- load 前会 assert block 存在且 ready。
+
+CPU manager 倾向 fail-closed：不确定能不能 safely 放进 cache，就不提交 store。
+
+### HF3FS
+
+HF3FS 的失败更多来自外部系统：
+
+- metadata server 不可达。
+- page allocation 失败。
+- device buffer 分配失败。
+- HF3FS read/write 返回字节数不等于 `bytes_per_page`。
+- block location 查不到。
+
+这些失败都被 `_fail_task` 记录成 future result `False` 和 metrics，见 `hf3fs_connector.py:422-433`。
+
+一个值得注意的点：`get_finished_operations` 只检查 future 是否 done，不区分 future result True/False，见 `hf3fs_connector.py:192-238`。也就是说 request-level “完成”不一定表示传输成功；传输成败主要体现在日志和 metrics 中。
+
+## 14. 指标和事件
+
+### CPU manager
+
+CPU manager 事件：
+
+- evict 时发 removed event
+- store 完成时发 stored event
+
+见 `manager.py:216-223`、`manager.py:266-273`。
+
+CPU manager 指标：
+
+- `vllm:kv_offload_cpu_cache_usage_perc`
+- `vllm:kv_offload_cpu_allocation_size`
+- 可选 `vllm:kv_offload_stores_skipped`
+
+见 `manager.py:294-319` 和 `vllm/v1/kv_offload/cpu/spec.py`。
+
+### HF3FS
+
+HF3FS 指标：
+
+- save/load duration
+- failed save/load count
+- total transfer task count
+
+见 `hf3fs_connector.py:1019-1107` 和 `hf3fs_connector.py:1110-1195`。
+
+HF3FS 当前没有像 CPU manager 那样的 KV cache stored/removed event 流，也没有 cache usage gauge。它更关注 I/O transfer performance，而不是 cache occupancy。
+
+## 15. 可扩展性和复用性
+
+### CPU manager 的扩展点
+
+CPU manager 的扩展点很清楚：
+
+- 新 cache policy：实现 `CachePolicy`。
+- 新 offload medium：实现新的 `OffloadingSpec` + `OffloadingWorker`，复用 `OffloadingConnector`。
+- 多级 offload：用 `TieringOffloadingSpec` / `TieringOffloadingManager` 组合 CPU primary 和 secondary tiers。
+
+尤其是 `CPUPrimaryTierOffloadingManager` 直接继承 `CPUOffloadingManager`，再给 secondary tier 暴露 `prepare_read/write` 别名和 CPU memoryview。这说明 CPU manager 被设计成可组合的 primary tier。
+
+### HF3FS 的扩展点
+
+HF3FS 的扩展点主要在 connector 内部：
+
+- 替换 `Hf3fsClient` I/O 实现。
+- 扩展 metadata server 的 page 回收、持久化、namespace、TTL。
+- 扩展 hash key 生成逻辑。
+- 改进 request scheduling state。
+- 增加 KV events 和失败回传。
+
+它不是基于 `OffloadingManager`/`OffloadingWorker` 分层接口实现的，因此复用 CPU/tiering 那套组件会比较难，但端到端路径更直接。
+
+## 16. 适用场景对比
+
+### 更适合 CPU manager / native CPU offloading 的场景
+
+- 单机或同机多 worker，希望用 CPU 内存扩展 GPU KV cache。
+- 需要明确容量控制和驱逐策略。
+- 需要低延迟 metadata 操作。
+- 希望和 vLLM 的 HMA、hybrid KV groups、events、tiering 架构集成。
+- 希望用 ARC/LRU 等策略优化 cache 命中。
+
+### 更适合 HF3FS 的场景
+
+- 多进程/多实例之间希望通过共享文件系统复用 KV。
+- KV cache 数据量大，希望落到分布式文件系统。
+- 可以接受 metadata server 作为外部依赖。
+- 更看重跨实例 prefix reuse，而不是本机 CPU cache 的精细驱逐。
+- 部署环境已经有 HF3FS/FUSE/io_uring 能力。
+
+## 17. 主要相同点
+
+- 都是 vLLM v1 KV cache 复用体系的一部分。
+- 都围绕 block 粒度存取 KV cache。
+- 都把 scheduler-side “能不能命中/需要加载多少” 和 worker-side “实际搬数据”分开。
+- 都支持异步完成：request 完成不一定等 KV 保存完成。
+- 都需要处理“数据正在写，不能被读”的 pending 状态。
+- 都有 metrics。
+- 都假设 block size 对齐是正确性的基础。
+
+## 18. 主要不同点
+
+| 维度 | CPUOffloadingManager | HF3FSKVConnector |
+|---|---|---|
+| 抽象层级 | manager，一层组件 | 完整 connector |
+| 介质 | CPU memory / mmap / pinned host memory | HF3FS 文件系统 |
+| 命中粒度 | 单 `OffloadKey` | request prefix 连续 blocks |
+| 数据移动 | 不在 manager 内；交给 CPUOffloadingWorker | connector 内部 gather/scatter + HF3FS I/O |
+| 元数据位置 | scheduler process 内存 | 外部 HTTP metadata server |
+| 驱逐 | LRU/ARC，严格容量控制 | 无热路径 eviction，page 不足即失败 |
+| pending 表示 | `BlockStatus.ref_cnt == -1` | metadata 未 complete 或 future 未完成 |
+| load 保护 | `ref_cnt` 防 eviction | 无本地驱逐，所以不需要类似保护 |
+| 多 rank 语义 | key 包含 group，worker/world size 由上层 spec 处理 | key 必须所有 rank confirm 才 complete |
+| 请求状态 | 外部 scheduler 管 | connector 内部维护 |
+| 指标重点 | cache usage、allocation、stores skipped | save/load latency、failed task |
+| 事件 | stored/removed KV events | 当前无类似事件流 |
+| 可组合性 | 强，能做 tiering primary | 较弱，更一体化 |
+
+## 19. 类比其他相似实现
+
+### OffloadingConnector
+
+路径：`vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py`
+
+这是 CPU manager 的直接上层包装。想理解 CPU manager 在完整 v1 connector 中怎么运行，应读：
+
+1. `offloading_connector.py`
+2. `offloading/scheduler.py`
+3. `offloading/worker.py`
+4. `kv_offload/cpu/spec.py`
+5. `kv_offload/cpu/manager.py`
+6. `kv_offload/cpu/gpu_worker.py`
+
+这条线最适合学习“vLLM 新 offloading 抽象”。
+
+### SimpleCPUOffloadConnector
+
+路径：`vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py`
+
+它也是 CPU offload，但比 `OffloadingConnector + CPUOffloadingManager` 更像老式一体化 connector。适合拿来对比“旧的一体化 CPU offload”和“新的 OffloadingSpec/Manager/Worker 分层”。
+
+### TieringOffloadingSpec / TieringOffloadingManager
+
+路径：`vllm/v1/kv_offload/tiering/`
+
+这套实现把 CPU 当 primary tier，再把 FS/OBJ/P2P 当 secondary tiers。它是 CPU manager 的自然延伸：
+
+```text
+GPU <-> CPU primary <-> FS/OBJ/P2P secondary
+```
+
+如果你想理解“为什么 CPU manager 要有 ref_cnt、memoryview、prepare/read/write 这些抽象”，tiering 是最好的参考。
+
+### FileSystemTierManager
+
+路径：`vllm/v1/kv_offload/tiering/fs/manager.py`
+
+它和 HF3FS 都涉及文件系统，但设计不同：
+
+- FS tier 是 secondary tier，只处理 CPU primary <-> 文件系统，不直接碰 GPU。
+- HF3FS connector 直接处理 GPU gather/scatter 和文件 I/O。
+- FS tier 通过 `FileMapper` 从 `OffloadKey` 映射到文件名；HF3FS 通过自算 md5 prefix hash 映射到 metadata server page。
+
+这两个对比能帮助你区分“作为 secondary tier 的文件系统”和“作为完整 connector 的文件系统”。
+
+### ObjectStoreSecondaryTierManager
+
+路径：`vllm/v1/kv_offload/tiering/obj/manager.py`
+
+它和 HF3FS 一样有外部存储和异步 lookup/load/store，但它遵循 tiering 抽象，只能经 CPU primary 访问数据。适合类比“外部存储后端如何接入标准 tiering 框架”。
+
+### NIXL / Mooncake / MoRIIO
+
+路径：
+
+- `vllm/distributed/kv_transfer/kv_connector/v1/nixl/`
+- `vllm/distributed/kv_transfer/kv_connector/v1/mooncake/`
+- `vllm/distributed/kv_transfer/kv_connector/v1/moriio/`
+
+这些更偏 disaggregated prefill/decode、RDMA 或跨节点传输。它们和 HF3FS 同属 `KVConnectorBase_V1` 直接 connector 家族，而不是 `OffloadingManager` 家族。
+
+学习时可以这样归类：
+
+- 本机 cache controller：`CPUOffloadingManager`
+- 新 offloading 分层框架：`OffloadingConnector`
+- 旧式 CPU connector：`SimpleCPUOffloadConnector`
+- 分层外部存储：`TieringOffloadingSpec` + FS/OBJ/P2P
+- 直接外部 KV connector：HF3FS、NIXL、Mooncake、MoRIIO、LMCache
+
+## 20. 推荐阅读路线
+
+如果目标是理解 CPU manager：
+
+1. `vllm/v1/kv_offload/base.py`：理解 `OffloadingManager` 的接口。
+2. `vllm/v1/kv_offload/cpu/policies/base.py`：理解 `BlockStatus.ref_cnt`。
+3. `vllm/v1/kv_offload/cpu/manager.py`：读 `lookup -> prepare_load -> complete_load -> prepare_store -> complete_store`。
+4. `vllm/v1/kv_offload/cpu/policies/lru.py` 和 `arc.py`：理解驱逐。
+5. `vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py`：看 manager 如何被调度器使用。
+6. `vllm/v1/kv_offload/cpu/gpu_worker.py`：看实际 copy。
+
+如果目标是理解 HF3FS：
+
+1. `vllm/distributed/kv_transfer/kv_connector/v1/base.py`：理解 `KVConnectorBase_V1`。
+2. `hf3fs/utils/common.py`：理解 request metadata。
+3. `hf3fs/hf3fs_connector.py` 的 scheduler methods：`get_num_new_matched_tokens`、`update_state_after_alloc`、`build_connector_meta`。
+4. `hf3fs/hf3fs_connector.py` 的 worker methods：`register_kv_caches`、`start_load_kv`、`wait_for_save`、`get_finished`。
+5. `hf3fs/hf3fs_metadata_server.py`：理解 key complete、rank/page allocation。
+6. `hf3fs/hf3fs_client.py`：理解 HF3FS I/O 和 CUDA/shared-memory bridge。
+
+## 21. 一句话心智模型
+
+可以把两者这样记：
+
+- `CPUOffloadingManager`：我有一块有限 CPU cache，哪些 key 在哪、能不能读、谁正在用、满了踢谁，都由我负责；搬数据另有人做。
+- `HF3FSKVConnector`：我把 prompt prefix KV 打包成文件系统 pages，靠 metadata server 判断哪些 prefix 已经全 rank 写完；我自己负责把 GPU KV gather 到 page、写文件、读回来再 scatter。
+
