@@ -1,0 +1,3 @@
+[submodule "hyper_cache"]
+	path = hyper_cache
+	url = git@github.com:heartplus/hyper_cache.git
